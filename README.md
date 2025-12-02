@@ -193,22 +193,30 @@ python server.py
 
 The backend will run on `http://localhost:5000`
 
-### Docker Setup for Web Agent
+### Docker Setup (Backend + Browser)
 
-The remote browser service allows you to view the AI agent's browsing activity:
+Run the backend and remote browser using Docker Compose:
 
 ```bash
-cd backend
-docker compose -f docker-compose.browser.yaml up --build remote-browser
+# From project root
+cp sample.env .env
+# Edit .env with your API keys
+
+# Start backend services
+docker compose up -d
 ```
 
-For detached mode:
+This starts:
+- Backend API on `http://localhost:5001`
+- Remote browser CDP on `http://localhost:9222`
+- Browser VNC viewer on `http://localhost:7900`
+
+Useful commands:
 ```bash
-docker compose -f docker-compose.browser.yaml up -d remote-browser
+docker compose logs -f      # View logs
+docker compose down         # Stop services
+docker compose up --build   # Rebuild after changes
 ```
-
-The browser VNC viewer will be available at `http://localhost:7900`
-
 ---
 
 ## Project Structure
@@ -247,7 +255,9 @@ PlatosCave/
 │   ├── service_adapter.py       # API for graph operations
 │   └── README.md                # Scoring mathematics
 ├── docs/
-│   └── img/                     # Documentation images
+│   ├── img/                     # Documentation images
+│   └── CLOUDFLARE_DEPLOYMENT.md # Deployment guide
+├── docker-compose.yml           # Docker services (backend + browser)
 ├── taskfile.yml                 # Task runner configuration
 ├── sample.env                   # Environment template
 └── README.md

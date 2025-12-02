@@ -66,28 +66,38 @@ def wait_for_http_ok(url: str, timeout: float = 30.0, interval: float = 1.5) -> 
     return False
 
 
+def make_cdp_request(url: str, method: str = 'GET', timeout: float = 5.0) -> Optional[str]:
+    """Make an HTTP request to CDP endpoint with required Host header."""
+    req = urllib_request.Request(url, method=method)
+    # Chrome DevTools requires Host header to be localhost or an IP
+    req.add_header('Host', 'localhost')
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as response:
+            if 200 <= response.status < 300:
+                return response.read().decode('utf-8')
+    except (URLError, HTTPError, ConnectionResetError) as e:
+        print(f"[SERVER DEBUG] CDP request error for {url}: {e}", flush=True)
+    return None
+
+
 def fetch_cdp_metadata(url: str, timeout: float = 5.0, retries: int = 3) -> Optional[dict]:
     """
     Retrieve Chrome DevTools metadata JSON from the remote browser.
     Retries on connection errors (browser may be restarting/busy).
     """
     for attempt in range(retries):
-        try:
-            with urllib_request.urlopen(url, timeout=timeout) as response:
-                if 200 <= response.status < 300:
-                    raw = response.read().decode('utf-8')
-                    return json.loads(raw)
-        except ConnectionResetError as e:
-            if attempt < retries - 1:
-                wait_time = 0.5 * (2 ** attempt)  # Exponential backoff: 0.5s, 1s, 2s
-                print(f"[SERVER DEBUG] Connection reset, retrying in {wait_time}s (attempt {attempt + 1}/{retries})", flush=True)
-                time.sleep(wait_time)
-            else:
-                print(f"[SERVER DEBUG] Connection reset after {retries} attempts", flush=True)
+        raw = make_cdp_request(url, timeout=timeout)
+        if raw:
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as e:
+                print(f"[SERVER DEBUG] CDP metadata JSON parse error: {e}", flush=True)
                 return None
-        except (URLError, HTTPError, json.JSONDecodeError) as e:
-            print(f"[SERVER DEBUG] CDP metadata fetch error: {e}", flush=True)
-            return None
+        # Retry on failure
+        if attempt < retries - 1:
+            wait_time = 0.5 * (2 ** attempt)
+            print(f"[SERVER DEBUG] Retrying CDP metadata fetch in {wait_time}s (attempt {attempt + 1}/{retries})", flush=True)
+            time.sleep(wait_time)
     return None
 
 
@@ -101,12 +111,15 @@ def close_all_browser_tabs() -> bool:
     """
     print("[SERVER DEBUG] ========== CLOSING ALL BROWSER TABS ==========", flush=True)
     try:
-        # Get list of all pages/tabs
-        list_url = f"{BROWSER_CDP_PUBLIC_URL.rstrip('/')}/json/list"
+        # Get list of all pages/tabs (use INTERNAL URL for Docker-to-Docker communication)
+        list_url = f"{BROWSER_CDP_INTERNAL_URL.rstrip('/')}/json/list"
         print(f"[SERVER DEBUG] Fetching tab list from: {list_url}", flush=True)
 
-        with urllib_request.urlopen(list_url, timeout=5) as response:
-            tabs = json.loads(response.read().decode('utf-8'))
+        raw = make_cdp_request(list_url, timeout=5)
+        if not raw:
+            print("[SERVER DEBUG] Failed to get tab list", flush=True)
+            return False
+        tabs = json.loads(raw)
 
         print(f"[SERVER DEBUG] Found {len(tabs)} tabs/targets", flush=True)
 
@@ -118,14 +131,13 @@ def close_all_browser_tabs() -> bool:
                 tab_url = tab.get('url', 'unknown')
                 print(f"[SERVER DEBUG] Closing tab {tab_id}: {tab_url[:80]}", flush=True)
 
-                close_url = f"{BROWSER_CDP_PUBLIC_URL.rstrip('/')}/json/close/{tab_id}"
-                try:
-                    with urllib_request.urlopen(close_url, timeout=5) as close_response:
-                        if 200 <= close_response.status < 300:
-                            closed_count += 1
-                            print(f"[SERVER DEBUG] ✓ Closed tab {tab_id}", flush=True)
-                except (URLError, HTTPError) as e:
-                    print(f"[SERVER DEBUG] Failed to close tab {tab_id}: {e}", flush=True)
+                close_url = f"{BROWSER_CDP_INTERNAL_URL.rstrip('/')}/json/close/{tab_id}"
+                result = make_cdp_request(close_url, timeout=5)
+                if result is not None:
+                    closed_count += 1
+                    print(f"[SERVER DEBUG] ✓ Closed tab {tab_id}", flush=True)
+                else:
+                    print(f"[SERVER DEBUG] Failed to close tab {tab_id}", flush=True)
 
         print(f"[SERVER DEBUG] Closed {closed_count} tabs successfully", flush=True)
         return True
@@ -149,12 +161,14 @@ def reset_browser_session() -> bool:
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
-            # Get list of all pages/tabs with timeout
-            list_url = f"{BROWSER_CDP_PUBLIC_URL.rstrip('/')}/json/list"
+            # Get list of all pages/tabs with timeout (use INTERNAL URL for Docker-to-Docker)
+            list_url = f"{BROWSER_CDP_INTERNAL_URL.rstrip('/')}/json/list"
             print(f"[SERVER DEBUG] Fetching tab list from: {list_url} (attempt {attempt + 1}/{max_attempts})", flush=True)
 
-            with urllib_request.urlopen(list_url, timeout=3) as response:
-                tabs = json.loads(response.read().decode('utf-8'))
+            raw = make_cdp_request(list_url, timeout=3)
+            if not raw:
+                raise ConnectionError("Failed to get tab list")
+            tabs = json.loads(raw)
 
             pages = [tab for tab in tabs if tab.get('type') == 'page']
             print(f"[SERVER DEBUG] Found {len(pages)} pages", flush=True)
@@ -169,13 +183,12 @@ def reset_browser_session() -> bool:
                 tab_url = tab.get('url', '')
                 print(f"[SERVER DEBUG] Closing non-blank tab {tab_id}: {tab_url[:60]}", flush=True)
 
-                close_url = f"{BROWSER_CDP_PUBLIC_URL.rstrip('/')}/json/close/{tab_id}"
-                try:
-                    req = urllib_request.Request(close_url, method='GET')
-                    with urllib_request.urlopen(req, timeout=2) as close_response:
-                        print(f"[SERVER DEBUG] ✓ Closed non-blank tab {tab_id}", flush=True)
-                except Exception as e:
-                    print(f"[SERVER DEBUG] ✗ Failed to close tab {tab_id}: {e} (continuing...)", flush=True)
+                close_url = f"{BROWSER_CDP_INTERNAL_URL.rstrip('/')}/json/close/{tab_id}"
+                result = make_cdp_request(close_url, timeout=2)
+                if result is not None:
+                    print(f"[SERVER DEBUG] ✓ Closed non-blank tab {tab_id}", flush=True)
+                else:
+                    print(f"[SERVER DEBUG] ✗ Failed to close tab {tab_id} (continuing...)", flush=True)
 
             # If there are multiple blank tabs, keep only one
             if len(blank_tabs) > 1:
@@ -183,25 +196,26 @@ def reset_browser_session() -> bool:
                 tabs_to_close = blank_tabs[1:]  # Keep first, close rest
                 for tab in tabs_to_close:
                     tab_id = tab.get('id')
-                    close_url = f"{BROWSER_CDP_PUBLIC_URL.rstrip('/')}/json/close/{tab_id}"
-                    try:
-                        req = urllib_request.Request(close_url, method='GET')
-                        with urllib_request.urlopen(req, timeout=2) as close_response:
-                            print(f"[SERVER DEBUG] ✓ Closed extra blank tab {tab_id}", flush=True)
-                    except Exception as e:
-                        print(f"[SERVER DEBUG] ✗ Failed to close blank tab {tab_id}: {e} (continuing...)", flush=True)
+                    close_url = f"{BROWSER_CDP_INTERNAL_URL.rstrip('/')}/json/close/{tab_id}"
+                    result = make_cdp_request(close_url, timeout=2)
+                    if result is not None:
+                        print(f"[SERVER DEBUG] ✓ Closed extra blank tab {tab_id}", flush=True)
+                    else:
+                        print(f"[SERVER DEBUG] ✗ Failed to close blank tab {tab_id} (continuing...)", flush=True)
 
             # If no blank tabs exist, create one
             if len(blank_tabs) == 0:
                 print(f"[SERVER DEBUG] No blank tabs found, creating one...", flush=True)
                 time.sleep(0.2)  # Brief pause
 
-                new_tab_url = f"{BROWSER_CDP_PUBLIC_URL.rstrip('/')}/json/new"
-                req = urllib_request.Request(new_tab_url, method='PUT')
-                with urllib_request.urlopen(req, timeout=3) as response:
-                    if 200 <= response.status < 300:
-                        tab_data = json.loads(response.read().decode('utf-8'))
+                new_tab_url = f"{BROWSER_CDP_INTERNAL_URL.rstrip('/')}/json/new"
+                raw = make_cdp_request(new_tab_url, method='PUT', timeout=3)
+                if raw:
+                    try:
+                        tab_data = json.loads(raw)
                         print(f"[SERVER DEBUG] ✓ Created blank tab with ID: {tab_data.get('id')}", flush=True)
+                    except json.JSONDecodeError:
+                        print(f"[SERVER DEBUG] Created new tab but couldn't parse response", flush=True)
             else:
                 print(f"[SERVER DEBUG] ✓ Kept existing blank tab", flush=True)
 
@@ -270,7 +284,12 @@ def kill_process_safely(process, timeout: float = 5.0) -> bool:
 
 
 def ensure_remote_browser_service() -> Optional[dict]:
-    """Ensure the remote browser Docker service is running and healthy."""
+    """Ensure the remote browser Docker service is running and healthy.
+    
+    When running inside Docker (via docker-compose), the remote browser container
+    is already managed by docker-compose, so we skip trying to start it and just
+    verify connectivity.
+    """
     print("[SERVER DEBUG] ========== STARTING ensure_remote_browser_service ==========", flush=True)
     emit_json_message({
         'type': 'UPDATE',
@@ -278,27 +297,24 @@ def ensure_remote_browser_service() -> Optional[dict]:
         'text': 'Ensuring remote browser service is running...'
     })
 
-    if not BROWSER_COMPOSE_FILE.exists():
-        emit_json_message({
-            'type': 'ERROR',
-            'message': f'Remote browser compose file not found at {BROWSER_COMPOSE_FILE}'
-        })
-        return None
-
-    try:
-        subprocess.run(
-            ['docker', 'compose', '-f', str(BROWSER_COMPOSE_FILE), 'up', '-d', 'remote-browser'],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-            cwd=BROWSER_COMPOSE_FILE.parent
-        )
-    except subprocess.CalledProcessError as exc:
-        emit_json_message({
-            'type': 'ERROR',
-            'message': f'Failed to start remote browser service: {exc}'
-        })
-        return None
+    # Check if we're running inside Docker (docker command won't be available)
+    # In Docker deployment, the remote-browser container is started by docker-compose
+    running_in_docker = not os.path.exists('/var/run/docker.sock')
+    
+    if not running_in_docker and BROWSER_COMPOSE_FILE.exists():
+        # Only try to start browser via docker if we're NOT inside a container
+        try:
+            subprocess.run(
+                ['docker', 'compose', '-f', str(BROWSER_COMPOSE_FILE), 'up', '-d', 'remote-browser'],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                cwd=BROWSER_COMPOSE_FILE.parent
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            print(f"[SERVER DEBUG] Could not start browser via docker: {exc} (will try to connect anyway)", flush=True)
+    else:
+        print("[SERVER DEBUG] Running in Docker or docker-compose not found - assuming browser container is already running", flush=True)
 
     # Check noVNC but don't fail if unavailable (it's for viewing only)
     print("[SERVER DEBUG] Checking noVNC endpoint (optional)...", flush=True)
@@ -326,35 +342,54 @@ def ensure_remote_browser_service() -> Optional[dict]:
         })
         return None
 
-    # Rewrite the advertised WebSocket endpoint to use public URL
-    ws_url = metadata.get('webSocketDebuggerUrl')
-    if ws_url:
-        print(f"[SERVER DEBUG] Original WebSocket URL from metadata: {ws_url}", flush=True)
+    # Build both PUBLIC and INTERNAL WebSocket URLs
+    # PUBLIC: for frontend (browser outside Docker) - uses localhost
+    # INTERNAL: for main.py (runs inside Docker) - uses remote-browser hostname
+    ws_url_original = metadata.get('webSocketDebuggerUrl')
+    ws_url_public = None
+    ws_url_internal = None
+    
+    if ws_url_original:
+        print(f"[SERVER DEBUG] Original WebSocket URL from metadata: {ws_url_original}", flush=True)
         
-        parsed_ws = urlparse(ws_url)
+        parsed_ws = urlparse(ws_url_original)
+        
+        # Build PUBLIC WebSocket URL (for frontend)
         parsed_cdp_public = urlparse(BROWSER_CDP_PUBLIC_URL)
-        
-        # Use public hostname and port
         public_hostname = parsed_cdp_public.hostname or 'localhost'
         public_port = parsed_cdp_public.port or 9222
+        ws_scheme_public = 'wss' if parsed_cdp_public.scheme == 'https' else 'ws'
+        ws_netloc_public = f"{public_hostname}:{public_port}"
+        ws_url_public = urlunparse((ws_scheme_public, ws_netloc_public, parsed_ws.path, '', '', ''))
         
-        # Determine WebSocket scheme based on public CDP URL (ws for http, wss for https)
-        ws_scheme = 'wss' if parsed_cdp_public.scheme == 'https' else 'ws'
+        # Build INTERNAL WebSocket URL (for main.py inside Docker)
+        parsed_cdp_internal = urlparse(BROWSER_CDP_INTERNAL_URL)
+        internal_hostname = parsed_cdp_internal.hostname or 'remote-browser'
+        internal_port = parsed_cdp_internal.port or 9222
+        ws_netloc_internal = f"{internal_hostname}:{internal_port}"
+        ws_url_internal = urlunparse(('ws', ws_netloc_internal, parsed_ws.path, '', '', ''))
         
-        # Rebuild WebSocket URL with public hostname/port
-        ws_netloc = f"{public_hostname}:{public_port}"
-        ws_url = urlunparse((ws_scheme, ws_netloc, parsed_ws.path, '', '', ''))
-        
-        print(f"[SERVER DEBUG] Rewritten WebSocket URL: {ws_url}", flush=True)
+        print(f"[SERVER DEBUG] Public WebSocket URL: {ws_url_public}", flush=True)
+        print(f"[SERVER DEBUG] Internal WebSocket URL: {ws_url_internal}", flush=True)
 
-    browser_payload = {
+    # Payload for frontend (public URLs)
+    browser_payload_public = {
         'type': 'BROWSER_ADDRESS',
         'novnc_url': BROWSER_NOVNC_PUBLIC_URL,
         'cdp_url': BROWSER_CDP_PUBLIC_URL,
-        'cdp_websocket': ws_url
+        'cdp_websocket': ws_url_public
     }
-    print(f"[SERVER DEBUG] About to emit BROWSER_ADDRESS: {browser_payload}", flush=True)
-    emit_json_message(browser_payload)
+    
+    # Payload for main.py subprocess (internal URLs)
+    browser_payload_internal = {
+        'type': 'BROWSER_ADDRESS',
+        'novnc_url': BROWSER_NOVNC_INTERNAL_URL,
+        'cdp_url': BROWSER_CDP_INTERNAL_URL,
+        'cdp_websocket': ws_url_internal
+    }
+    
+    print(f"[SERVER DEBUG] About to emit BROWSER_ADDRESS (public): {browser_payload_public}", flush=True)
+    emit_json_message(browser_payload_public)
     print(f"[SERVER DEBUG] BROWSER_ADDRESS emitted!", flush=True)
 
     emit_json_message({
@@ -364,7 +399,12 @@ def ensure_remote_browser_service() -> Optional[dict]:
     })
 
     print("[SERVER DEBUG] ========== ensure_remote_browser_service COMPLETED ==========", flush=True)
-    return browser_payload
+    
+    # Return both payloads - caller uses internal for subprocess, public for frontend
+    return {
+        'public': browser_payload_public,
+        'internal': browser_payload_internal
+    }
 
 def run_script_and_stream_output(filepath, settings):
     """
@@ -377,10 +417,14 @@ def run_script_and_stream_output(filepath, settings):
 
     # Ensure remote browser is available (needed for claim verification even in PDF mode)
     print("[SERVER DEBUG] Ensuring remote browser service for verification...", flush=True)
-    browser_info = ensure_remote_browser_service()
-    if browser_info is None:
+    browser_result = ensure_remote_browser_service()
+    if browser_result is None:
         print("[SERVER DEBUG] Remote browser failed, falling back to local browser", flush=True)
-        browser_info = {}  # Empty dict to signal local browser mode
+        browser_info_internal = {}
+        browser_info_public = {}
+    else:
+        browser_info_internal = browser_result.get('internal', {})
+        browser_info_public = browser_result.get('public', {})
 
     command = [
         'python', 'main.py', '--pdf', filepath,
@@ -392,17 +436,19 @@ def run_script_and_stream_output(filepath, settings):
     env = os.environ.copy()
     env['SUPPRESS_LOGS'] = 'true'
 
-    # Set remote browser environment variables (same as URL mode)
-    if browser_info:
-        cdp_url = browser_info.get('cdp_url')
-        cdp_ws = browser_info.get('cdp_websocket')
+    # Set remote browser environment variables using INTERNAL URLs (for Docker networking)
+    if browser_info_internal:
+        cdp_url = browser_info_internal.get('cdp_url')
+        cdp_ws = browser_info_internal.get('cdp_websocket')
         if cdp_url:
             env['REMOTE_BROWSER_CDP_URL'] = cdp_url
         if cdp_ws:
             env['REMOTE_BROWSER_CDP_WS'] = cdp_ws
-        novnc_url = browser_info.get('novnc_url')
+        novnc_url = browser_info_internal.get('novnc_url')
         if novnc_url:
             env['REMOTE_BROWSER_NOVNC_URL'] = novnc_url
+        print(f"[SERVER DEBUG] Passing internal CDP URL to main.py: {cdp_url}", flush=True)
+        print(f"[SERVER DEBUG] Passing internal CDP WS to main.py: {cdp_ws}", flush=True)
     else:
         # Ensure remote browser env vars are not set for local browser fallback
         env.pop('REMOTE_BROWSER_CDP_URL', None)
@@ -424,10 +470,10 @@ def run_script_and_stream_output(filepath, settings):
     print(f"[SERVER DEBUG] Subprocess started with PID: {process.pid}", flush=True)
 
     # Re-emit browser info to ensure frontend WebSocket has connected and receives it
-    # Same as URL mode - this makes the browser viewer appear in the frontend
-    if browser_info and browser_info.get('cdp_url'):
-        print(f"[SERVER DEBUG] Re-emitting BROWSER_ADDRESS to frontend: {browser_info}", flush=True)
-        socketio.emit('status_update', {'data': json.dumps(browser_info)})
+    # Use PUBLIC URLs for frontend (so browser opens user's localhost, not Docker internal)
+    if browser_info_public and browser_info_public.get('cdp_url'):
+        print(f"[SERVER DEBUG] Re-emitting BROWSER_ADDRESS to frontend (public): {browser_info_public}", flush=True)
+        socketio.emit('status_update', {'data': json.dumps(browser_info_public)})
         socketio.sleep(0.1)  # Small delay to ensure delivery
         print("[SERVER DEBUG] BROWSER_ADDRESS re-emitted!", flush=True)
     else:
@@ -497,18 +543,20 @@ def run_url_analysis_and_stream_output(url, settings, session_id=None):
     socketio.sleep(0.5)
 
     print("[SERVER DEBUG] Calling ensure_remote_browser_service()...", flush=True)
-    browser_info = ensure_remote_browser_service()
-    if browser_info is None:
+    browser_result = ensure_remote_browser_service()
+    if browser_result is None:
         print("[SERVER DEBUG] Remote browser failed, falling back to local browser", flush=True)
         emit_json_message({
             'type': 'WARNING',
             'message': 'Remote browser unavailable, using local browser fallback'
         })
-        # Don't set CDP environment variables - let main.py use local browser
-        # Continue with process launch without remote browser config
-        browser_info = {}  # Empty dict to signal local browser mode
+        browser_info_internal = {}
+        browser_info_public = {}
     else:
-        print(f"[SERVER DEBUG] Browser info received: {browser_info}", flush=True)
+        browser_info_internal = browser_result.get('internal', {})
+        browser_info_public = browser_result.get('public', {})
+        print(f"[SERVER DEBUG] Browser info internal: {browser_info_internal}", flush=True)
+        print(f"[SERVER DEBUG] Browser info public: {browser_info_public}", flush=True)
 
     command = [
         'python', 'main.py', '--url', url,
@@ -521,17 +569,19 @@ def run_url_analysis_and_stream_output(url, settings, session_id=None):
     env = os.environ.copy()
     env['SUPPRESS_LOGS'] = 'true'
 
-    # Only set remote browser environment variables if we successfully got browser info
-    if browser_info:
-        cdp_url = browser_info.get('cdp_url')
-        cdp_ws = browser_info.get('cdp_websocket')
+    # Set remote browser environment variables using INTERNAL URLs (for Docker networking)
+    if browser_info_internal:
+        cdp_url = browser_info_internal.get('cdp_url')
+        cdp_ws = browser_info_internal.get('cdp_websocket')
         if cdp_url:
             env['REMOTE_BROWSER_CDP_URL'] = cdp_url
         if cdp_ws:
             env['REMOTE_BROWSER_CDP_WS'] = cdp_ws
-        novnc_url = browser_info.get('novnc_url')
+        novnc_url = browser_info_internal.get('novnc_url')
         if novnc_url:
             env['REMOTE_BROWSER_NOVNC_URL'] = novnc_url
+        print(f"[SERVER DEBUG] Passing internal CDP URL to main.py: {cdp_url}", flush=True)
+        print(f"[SERVER DEBUG] Passing internal CDP WS to main.py: {cdp_ws}", flush=True)
     else:
         # Ensure remote browser env vars are not set for local browser fallback
         env.pop('REMOTE_BROWSER_CDP_URL', None)
@@ -558,10 +608,10 @@ def run_url_analysis_and_stream_output(url, settings, session_id=None):
         print(f"[SERVER DEBUG] Tracking process {process.pid} for session {session_id}", flush=True)
 
     # Re-emit browser info to ensure frontend WebSocket has connected and receives it
-    # Only emit if we have actual remote browser info
-    if browser_info and browser_info.get('cdp_url'):
-        print(f"[SERVER DEBUG] Re-emitting BROWSER_ADDRESS to frontend: {browser_info}", flush=True)
-        socketio.emit('status_update', {'data': json.dumps(browser_info)})
+    # Use PUBLIC URLs for frontend (so browser opens user's localhost, not Docker internal)
+    if browser_info_public and browser_info_public.get('cdp_url'):
+        print(f"[SERVER DEBUG] Re-emitting BROWSER_ADDRESS to frontend (public): {browser_info_public}", flush=True)
+        socketio.emit('status_update', {'data': json.dumps(browser_info_public)})
         socketio.sleep(0.1)  # Small delay to ensure delivery
         print("[SERVER DEBUG] BROWSER_ADDRESS re-emitted!", flush=True)
     else:
@@ -695,5 +745,5 @@ def handle_disconnect():
     reset_browser_session()
 
 if __name__ == '__main__':
-    socketio.run(app, port=5000, debug=True)
+    socketio.run(app, host='0.0.0.0', port=5001, debug=True, allow_unsafe_werkzeug=True)
 

@@ -1,17 +1,20 @@
-// PlatosCave/frontend/src/pages/index.tsx
-import React, { useState, useEffect } from 'react';
+// PlatosCave/frontend/src/App.tsx
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
 import { io, Socket } from 'socket.io-client';
 import { Settings as SettingsIcon, ChevronLeft, ChevronRight } from 'lucide-react';
-import Navbar from '../components/landing/Navbar';
-import Hero from '../components/landing/Hero';
-import Footer from '../components/landing/Footer';
-import { ProcessStep } from '../components/Sidebar';
-import XmlGraphViewer from '../components/XmlGraphViewer';
-import SettingsDrawer from '../components/SettingsDrawer';
-import { Settings } from '../components/SettingsModal';
-import ProgressBar from '../components/ProgressBar';
-import platosCaveLogo from '../images/platos-cave-logo.png';
+import Navbar from './components/landing/Navbar';
+import Hero from './components/landing/Hero';
+import Footer from './components/landing/Footer';
+import { ProcessStep } from './components/Sidebar';
+import XmlGraphViewer from './components/XmlGraphViewer';
+import SettingsDrawer from './components/SettingsDrawer';
+import { Settings } from './components/SettingsModal';
+import ProgressBar from './components/ProgressBar';
+import BrowserViewer from './components/BrowserViewer';
+import platosCaveLogo from './images/platos-cave-logo.png';
+
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001';
 
 const INITIAL_STAGES: ProcessStep[] = [
   { name: "Validate", displayText: "Pending...", status: 'pending' },
@@ -22,13 +25,20 @@ const INITIAL_STAGES: ProcessStep[] = [
   { name: "Evaluating Integrity", displayText: "Pending...", status: 'pending' },
 ];
 
-const IndexPage = () => {
+const App: React.FC = () => {
   const [processSteps, setProcessSteps] = useState<ProcessStep[]>([]);
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [submittedUrl, setSubmittedUrl] = useState<string | null>(null);
   const [finalScore, setFinalScore] = useState<number | null>(null);
   const [graphmlData, setGraphmlData] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const socketRef = useRef<Socket | null>(null);
+  
+  // Browser viewer state for human-in-the-loop
+  const [isBrowserOpen, setIsBrowserOpen] = useState(false);
+  const [novncUrl, setNovncUrl] = useState<string | undefined>(undefined);
+  const [cdpUrl, setCdpUrl] = useState<string | undefined>(undefined);
+  const [cdpWebSocket, setCdpWebSocket] = useState<string | undefined>(undefined);
 
   const [settings, setSettings] = useState<Settings>({
     agentAggressiveness: 5,
@@ -48,69 +58,136 @@ const IndexPage = () => {
     limitation: 1.0,
   });
 
-  // WebSocket connection for updates
-  useEffect(() => {
-    if (!uploadedFile && !submittedUrl) return;
-
-    const socket: Socket = io('http://localhost:5000');
-    socket.on('connect', () => console.log('Connected to WebSocket server!'));
-
-    socket.on('status_update', (msg: { data: string }) => {
-      try {
-        const update = JSON.parse(msg.data);
-        if (update.type === 'UPDATE') {
-          setProcessSteps(prev => {
-            let activeIndex = prev.findIndex(s => s.name === update.stage);
-            return prev.map((s, i) => {
-              if (i === activeIndex) return { ...s, displayText: update.text, status: 'active' };
-              if (i < activeIndex) return { ...s, status: 'completed' };
-              return s;
-            });
+  // Handle WebSocket messages
+  const handleSocketMessage = useCallback((msg: { data: string }) => {
+    try {
+      const update = JSON.parse(msg.data);
+      console.log('[WebSocket] Received:', update.type, update);
+      
+      if (update.type === 'UPDATE') {
+        setProcessSteps(prev => {
+          const activeIndex = prev.findIndex(s => s.name === update.stage);
+          return prev.map((s, i) => {
+            if (i === activeIndex) return { ...s, displayText: update.text, status: 'active' };
+            if (i < activeIndex) return { ...s, status: 'completed' };
+            return s;
           });
-        } else if (update.type === 'GRAPH_DATA') {
-          setGraphmlData(update.data);
-        } else if (update.type === 'DONE') {
-          setFinalScore(update.score);
-          setProcessSteps(prev => prev.map(s => ({ ...s, status: 'completed' })));
-          socket.disconnect();
-        }
-      } catch (e) {
-        console.error('WebSocket parse error:', e);
+        });
+      } else if (update.type === 'BROWSER_ADDRESS') {
+        // Remote browser is ready - show the embedded viewer
+        console.log('[WebSocket] Browser address received:', update);
+        setNovncUrl(update.novnc_url);
+        setCdpUrl(update.cdp_url);
+        setCdpWebSocket(update.cdp_websocket);
+        setIsBrowserOpen(true);
+      } else if (update.type === 'GRAPH_DATA') {
+        console.log('[WebSocket] Setting graph data');
+        setGraphmlData(update.data);
+      } else if (update.type === 'DONE') {
+        console.log('[WebSocket] Analysis complete, score:', update.score);
+        setFinalScore(update.score);
+        setProcessSteps(prev => prev.map(s => ({ ...s, status: 'completed' })));
+        // Optionally close browser viewer when done
+        // setIsBrowserOpen(false);
       }
-    });
+    } catch (e) {
+      console.error('WebSocket parse error:', e);
+    }
+  }, []);
 
-    return () => socket.disconnect();
-  }, [uploadedFile, submittedUrl]);
+  // Connect WebSocket and return a promise that resolves when connected
+  const connectSocket = useCallback((): Promise<Socket> => {
+    return new Promise((resolve) => {
+      // Disconnect existing socket if any
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+      }
+
+      console.log('[WebSocket] Connecting to:', API_BASE_URL);
+      const socket = io(API_BASE_URL, {
+        transports: ['websocket', 'polling'],
+        reconnection: true,
+        reconnectionAttempts: 5,
+        reconnectionDelay: 1000,
+      });
+      
+      socketRef.current = socket;
+
+      socket.on('connect', () => {
+        console.log('[WebSocket] Connected! Socket ID:', socket.id);
+        resolve(socket);
+      });
+
+      socket.on('disconnect', (reason) => {
+        console.log('[WebSocket] Disconnected:', reason);
+      });
+
+      socket.on('connect_error', (error) => {
+        console.error('[WebSocket] Connection error:', error);
+      });
+
+      socket.on('status_update', handleSocketMessage);
+    });
+  }, [handleSocketMessage]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+      }
+    };
+  }, []);
 
   const handleFileUpload = async (file: File) => {
+    // Reset state first
+    setProcessSteps(INITIAL_STAGES);
+    setFinalScore(null);
+    setGraphmlData(null);
+    setUploadedFile(file);
+    setSubmittedUrl(null);
+    // Reset browser viewer state
+    setIsBrowserOpen(false);
+    setNovncUrl(undefined);
+    setCdpUrl(undefined);
+    setCdpWebSocket(undefined);
+
+    // Connect WebSocket FIRST, then make API call
+    await connectSocket();
+
     const formData = new FormData();
     formData.append('file', file);
     Object.entries(settings).forEach(([key, value]) =>
       formData.append(key, value.toString())
     );
 
-    setProcessSteps(INITIAL_STAGES);
-    setFinalScore(null);
-    setGraphmlData(null);
-    setUploadedFile(file);
-    setSubmittedUrl(null);
-
     try {
-      await axios.post('http://localhost:5000/api/upload', formData);
+      console.log('[API] Uploading file:', file.name);
+      await axios.post(`${API_BASE_URL}/api/upload`, formData);
     } catch (error) {
       console.error('Error uploading file:', error);
     }
   };
 
   const handleUrlSubmit = async (url: string) => {
+    // Reset state first
     setProcessSteps(INITIAL_STAGES);
     setFinalScore(null);
     setGraphmlData(null);
     setSubmittedUrl(url);
     setUploadedFile(null);
+    // Reset browser viewer state
+    setIsBrowserOpen(false);
+    setNovncUrl(undefined);
+    setCdpUrl(undefined);
+    setCdpWebSocket(undefined);
+
+    // Connect WebSocket FIRST, then make API call
+    await connectSocket();
 
     try {
-      await axios.post('http://localhost:5000/api/analyze-url', { url, ...settings });
+      console.log('[API] Analyzing URL:', url);
+      await axios.post(`${API_BASE_URL}/api/analyze-url`, { url, ...settings });
     } catch (error) {
       console.error('Error analyzing URL:', error);
     }
@@ -166,6 +243,17 @@ const IndexPage = () => {
           <span className="max-w-full truncate font-mono text-xs text-text-secondary sm:max-w-md sm:text-sm">
             {uploadedFile ? uploadedFile.name : submittedUrl}
           </span>
+          {/* Show Browser button - only when browser URL is available */}
+          {novncUrl && !isBrowserOpen && (
+            <button
+              onClick={() => setIsBrowserOpen(true)}
+              className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-white bg-emerald-500 hover:bg-emerald-600 transition-colors duration-200"
+              title="Show remote browser"
+            >
+              <div className="w-2 h-2 rounded-full bg-white animate-pulse" />
+              Show Browser
+            </button>
+          )}
           <button
             onClick={() => setIsSettingsOpen(true)}
             className="rounded-lg p-2 text-text-muted transition-colors duration-200 hover:bg-gray-100 hover:text-text-primary"
@@ -201,6 +289,17 @@ const IndexPage = () => {
       {/* Main content */}
       <div className="relative flex-grow overflow-hidden">
         <ProgressBar steps={processSteps} />
+        
+        {/* Browser Viewer - Human in the Loop (floats/overlays when open) */}
+        <BrowserViewer
+          isOpen={isBrowserOpen}
+          onClose={() => setIsBrowserOpen(false)}
+          novncUrl={novncUrl}
+          cdpUrl={cdpUrl}
+          cdpWebSocket={cdpWebSocket}
+        />
+        
+        {/* Graph Viewer - always visible in background */}
         <div className="flex-grow p-4" style={{ height: "calc(100vh - 150px)" }}>
           <XmlGraphViewer graphmlData={graphmlData} isDrawerOpen={isSettingsOpen} />
         </div>
@@ -218,4 +317,5 @@ const IndexPage = () => {
   );
 };
 
-export default IndexPage;
+export default App;
+
