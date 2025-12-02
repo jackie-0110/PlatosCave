@@ -1,25 +1,59 @@
 # PlatosCave/server.py
 import os
 import subprocess
-import json  # Make sure json is imported
+import json
 import time
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 from urllib import request as urllib_request
 from urllib.error import URLError, HTTPError
 from urllib.parse import urlparse, urlunparse
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from flask_socketio import SocketIO
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+
+# API Key for authentication (set via environment variable)
+API_KEY = os.environ.get('PLATOS_CAVE_API_KEY', '')
+
+# CORS configuration - restrict to allowed origins, support credentials (cookies)
+ALLOWED_ORIGINS = [
+    "https://platoscave.jackie-courtney.com",
+    "https://platoscave.jackieec956.workers.dev",  # Your Cloudflare Pages domain
+    "http://localhost:5173",  # Vite dev server
+    "http://localhost:8000",  # Local preview
+]
+
+CORS(app, 
+     resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+     supports_credentials=True)
+
 socketio = SocketIO(
     app,
-    cors_allowed_origins="*",
+    cors_allowed_origins=ALLOWED_ORIGINS,
     ping_timeout=300,  # 5 minutes before considering connection dead
     ping_interval=25   # Send ping every 25 seconds to keep connection alive
 )
+
+
+def require_api_key(f):
+    """Decorator to require API key for protected endpoints."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Skip API key check if no key is configured (development mode)
+        if not API_KEY:
+            return f(*args, **kwargs)
+        
+        # Check for API key in header
+        provided_key = request.headers.get('X-API-Key', '')
+        if provided_key != API_KEY:
+            print(f"[SERVER DEBUG] API key rejected: provided='{provided_key[:8]}...' (length {len(provided_key)})", flush=True)
+            return jsonify({'error': 'Invalid or missing API key'}), 401
+        
+        return f(*args, **kwargs)
+    return decorated_function
 
 UPLOAD_FOLDER = 'papers'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -649,6 +683,7 @@ def run_url_analysis_and_stream_output(url, settings, session_id=None):
 
 
 @app.route('/api/upload', methods=['POST'])
+@require_api_key
 def upload_file():
     if 'file' not in request.files:
         return 'No file part', 400
@@ -672,6 +707,7 @@ def upload_file():
 
 
 @app.route('/api/cleanup', methods=['POST'])
+@require_api_key
 def cleanup():
     """
     Cleanup endpoint: Reset browser state to prepare for new analysis
@@ -695,6 +731,7 @@ def cleanup():
 
 
 @app.route('/api/analyze-url', methods=['POST'])
+@require_api_key
 def analyze_url():
     """
     Analyze a research paper from URL using browser-use + DAG generation

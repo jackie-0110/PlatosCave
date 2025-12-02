@@ -1,5 +1,5 @@
 tunnel: platos-cave-api
-credentials-file: /home/jackiecourtney/.cloudflared/platos-cave-api.json
+credentials-file: /Users/jackiecourtney/.cloudflared/c905d714-cb21-4932-ae77-9de2f30dcc77.json
 
 ingress:
   - hostname: api.jackie-courtney.com
