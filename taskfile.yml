@@ -37,7 +37,7 @@ tasks:
     status:
       - test -f {{.BACKEND_DIR}}/.env
   start-server:
-    dir: '{{BACKEND_DIR}}' 
+    dir: '{{.BACKEND_DIR}}' 
     cmds:
       - uv run python server.py
   setup-vnc:
