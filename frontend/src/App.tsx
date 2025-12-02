@@ -16,6 +16,10 @@ import platosCaveLogo from './images/platos-cave-logo.png';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001';
 
+// Cloudflare Access Service Token credentials (for authenticated API access)
+const CF_ACCESS_CLIENT_ID = import.meta.env.VITE_CF_ACCESS_CLIENT_ID || '';
+const CF_ACCESS_CLIENT_SECRET = import.meta.env.VITE_CF_ACCESS_CLIENT_SECRET || '';
+
 const INITIAL_STAGES: ProcessStep[] = [
   { name: "Validate", displayText: "Pending...", status: 'pending' },
   { name: "Decomposing PDF", displayText: "Pending...", status: 'pending' },
@@ -104,12 +108,25 @@ const App: React.FC = () => {
       }
 
       console.log('[WebSocket] Connecting to:', API_BASE_URL);
-      const socket = io(API_BASE_URL, {
+      
+      // Build socket options with Cloudflare Access headers if credentials are set
+      const socketOptions: Parameters<typeof io>[1] = {
         transports: ['websocket', 'polling'],
         reconnection: true,
         reconnectionAttempts: 5,
         reconnectionDelay: 1000,
-      });
+      };
+      
+      // Add Cloudflare Access Service Token headers if configured
+      if (CF_ACCESS_CLIENT_ID && CF_ACCESS_CLIENT_SECRET) {
+        socketOptions.extraHeaders = {
+          'CF-Access-Client-Id': CF_ACCESS_CLIENT_ID,
+          'CF-Access-Client-Secret': CF_ACCESS_CLIENT_SECRET,
+        };
+        console.log('[WebSocket] Using Cloudflare Access Service Token');
+      }
+      
+      const socket = io(API_BASE_URL, socketOptions);
       
       socketRef.current = socket;
 
@@ -163,7 +180,12 @@ const App: React.FC = () => {
 
     try {
       console.log('[API] Uploading file:', file.name);
-      await axios.post(`${API_BASE_URL}/api/upload`, formData);
+      const headers: Record<string, string> = {};
+      if (CF_ACCESS_CLIENT_ID && CF_ACCESS_CLIENT_SECRET) {
+        headers['CF-Access-Client-Id'] = CF_ACCESS_CLIENT_ID;
+        headers['CF-Access-Client-Secret'] = CF_ACCESS_CLIENT_SECRET;
+      }
+      await axios.post(`${API_BASE_URL}/api/upload`, formData, { headers });
     } catch (error) {
       console.error('Error uploading file:', error);
     }
@@ -187,7 +209,12 @@ const App: React.FC = () => {
 
     try {
       console.log('[API] Analyzing URL:', url);
-      await axios.post(`${API_BASE_URL}/api/analyze-url`, { url, ...settings });
+      const headers: Record<string, string> = {};
+      if (CF_ACCESS_CLIENT_ID && CF_ACCESS_CLIENT_SECRET) {
+        headers['CF-Access-Client-Id'] = CF_ACCESS_CLIENT_ID;
+        headers['CF-Access-Client-Secret'] = CF_ACCESS_CLIENT_SECRET;
+      }
+      await axios.post(`${API_BASE_URL}/api/analyze-url`, { url, ...settings }, { headers });
     } catch (error) {
       console.error('Error analyzing URL:', error);
     }
